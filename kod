@@ -1,0 +1,233 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Servo.h>
+
+// ================= LCD =================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ================= RFID =================
+#define SS_PIN 10
+#define RST_PIN 9
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+// ================= Encoder =================
+#define CLK 2
+#define DT 3
+#define SW 4
+
+// ================= Servo & Buzzer =================
+Servo servo;
+#define SERVO_PIN 5
+#define BUZZER_PIN 6
+
+// ================= UID =================
+byte allowedUID[4] = {0x75, 0xC5, 0xF5, 0x04};
+
+// ================= Variables =================
+int minutes = 0;
+int seconds = 0;
+
+int menuState = 0; // 0=min, 1=sec, 2=ready
+int lastCLK;
+bool systemStarted = false;
+
+long totalTime = 0;
+long remainingTime = 0;
+unsigned long previousMillis = 0; // Geri sayım için
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(9600);
+
+  lcd.init();
+  lcd.backlight();
+
+  SPI.begin();
+  rfid.PCD_Init();
+
+  pinMode(CLK, INPUT);
+  pinMode(DT, INPUT);
+  pinMode(SW, INPUT_PULLUP);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+
+  servo.attach(SERVO_PIN);
+  servo.write(0); // Açık konum
+
+  lastCLK = digitalRead(CLK);
+
+  lcd.setCursor(0,0);
+  lcd.print("FOCUS BOX");
+  delay(1500);
+  lcd.clear();
+}
+
+// ================= BUTTON (Hata Düzeltmesi) =================
+// loop() içinden çıkarıldı
+bool buttonPressed() {
+  if (digitalRead(SW) == LOW) {
+    delay(50); // Debounce
+    if (digitalRead(SW) == LOW) {
+      while (digitalRead(SW) == LOW); // Buton bırakılana kadar bekle
+      return true;
+    }
+  }
+  return false;
+}
+
+// ================= ENCODER =================
+void readEncoder() {
+  int currentCLK = digitalRead(CLK);
+
+  if (currentCLK != lastCLK && currentCLK == 0) {
+    if (digitalRead(DT) != currentCLK) {
+      // İleri (Saat Yönü)
+      if (menuState == 0) minutes++;
+      else if (menuState == 1) {
+        seconds++;
+        if (seconds > 59) seconds = 0;
+      }
+    } else {
+      // Geri (Saat Yönü Tersi)
+      if (menuState == 0 && minutes > 0) minutes--;
+      else if (menuState == 1 && seconds > 0) seconds--;
+      else if (menuState == 1 && seconds == 0) seconds = 59;
+    }
+  }
+  lastCLK = currentCLK;
+}
+
+// ================= UID CHECK =================
+bool checkUID() {
+  if (rfid.uid.size != 4) return false;
+
+  for (byte i = 0; i < 4; i++) {
+    if (rfid.uid.uidByte[i] != allowedUID[i]) return false;
+  }
+  return true;
+}
+
+// ================= LOOP =================
+void loop() {
+  if (!systemStarted) {
+    // AŞAMA 1: Ayar ve Kart Bekleme
+    readEncoder();
+
+    // Buton Kontrolü
+    if (buttonPressed()) {
+      menuState++;
+
+      if (menuState > 2) menuState = 2;
+
+      if (menuState == 2) {
+        totalTime = (minutes * 60L) + seconds;
+        
+        // Süre 0 ise kilitlenmeyi engelle
+        if (totalTime == 0) {
+          menuState = 1;
+          lcd.clear();
+          lcd.setCursor(0,0);
+          lcd.print("Sure 0 Olamaz!");
+          delay(1000);
+          lcd.clear();
+        } else {
+          remainingTime = totalTime;
+          lcd.clear();
+          lcd.setCursor(0,0);
+          lcd.print("Kart Bekleniyor");
+        }
+      }
+    }
+
+    // Ekran Güncellemesi
+    if (menuState < 2) {
+      lcd.setCursor(0,0);
+      if (menuState == 0) lcd.print("Ayar: Dakika    ");
+      else lcd.print("Ayar: Saniye    ");
+
+      lcd.setCursor(0,1);
+      lcd.print("Min:");
+      if (minutes < 10) lcd.print("0");
+      lcd.print(minutes);
+      lcd.print(" Sec:");
+      if (seconds < 10) lcd.print("0");
+      lcd.print(seconds);
+      lcd.print("   ");
+    }
+
+    // RFID Kontrolü
+    if (menuState == 2) {
+      if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
+        if (checkUID()) {
+          systemStarted = true;
+          servo.write(90); // Kilitle
+
+          lcd.clear();
+          lcd.setCursor(0,0);
+          lcd.print("Kilitlendi!");
+          delay(1000);
+          
+          lcd.clear();
+          previousMillis = millis(); // Sayacı başlat
+        } else {
+          // Yanlış kart okutulursa
+          lcd.clear();
+          lcd.setCursor(0,0);
+          lcd.print("Gecersiz Kart!");
+          delay(1000);
+          lcd.clear();
+          lcd.setCursor(0,0);
+          lcd.print("Kart Bekleniyor");
+        }
+        rfid.PICC_HaltA();
+      }
+    }
+  } 
+  
+  // AŞAMA 2: Geri Sayım
+  else {
+    unsigned long currentMillis = millis();
+
+    if (remainingTime > 0) {
+      // Her 1000 ms'de (1 saniyede) bir çalışır
+      if (currentMillis - previousMillis >= 1000) {
+        previousMillis = currentMillis;
+        remainingTime--;
+
+        lcd.setCursor(0,0);
+        lcd.print("Kalan Sure:     ");
+
+        lcd.setCursor(0,1);
+        int m = remainingTime / 60;
+        int s = remainingTime % 60;
+
+        if (m < 10) lcd.print("0");
+        lcd.print(m);
+        lcd.print(":");
+        if (s < 10) lcd.print("0");
+        lcd.print(s);
+        lcd.print("      ");
+      }
+    } else {
+      // Süre Bittiğinde
+      servo.write(0); // Aç
+
+      lcd.clear();
+      lcd.setCursor(0,0);
+      lcd.print("SURE BITTI");
+
+      digitalWrite(BUZZER_PIN, HIGH);
+      delay(2000);
+      digitalWrite(BUZZER_PIN, LOW);
+
+      // Cihazı yeni kullanıma hazırla
+      systemStarted = false;
+      menuState = 0;
+      minutes = 0;
+      seconds = 0;
+      lcd.clear();
+    }
+  }
+}
